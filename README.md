@@ -37,7 +37,7 @@ All fee parameters are `constant`. There are no admin-settable fee variables, so
 | `FEE_LEN2` | 5 ETC | Fee for 2-byte labels |
 | `FEE_LEN3` | 1 ETC | Fee for 3-byte labels |
 | `FEE_LEN4` | 0.25 ETC | Fee for 4-byte labels |
-| `DEFAULT_FEE` | 0.5 ETC | Fee for 5+ byte labels |
+| `DEFAULT_FEE` | 0.05 ETC | Fee for 5+ byte labels |
 | `MAX_PREMIUM` | 100 ETC | Fixed starting anti-snipe premium |
 | `PREMIUM_DECAY_PERIOD` | 21 days | Fixed premium decay window |
 
