@@ -1,0 +1,920 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+import {ERC721} from "https://github.com/Vectorized/solady/blob/main/src/tokens/ERC721.sol";
+import {SafeTransferLib} from "https://github.com/Vectorized/solady/blob/main/src/utils/SafeTransferLib.sol";
+import {ReentrancyGuard} from "https://github.com/Vectorized/solady/blob/main/src/utils/ReentrancyGuard.sol";
+import {INameMetadataRenderer} from "./NameMetadataRenderer.sol";
+
+/// @title NameNFT
+/// @notice ENS-style naming system for .etc TLD with ERC721 ownership
+/// @dev Token ID = uint256(namehash). ENS-compatible resolution.
+///
+/// Unicode Support:
+/// - This contract validates UTF-8 encoding and accepts valid UTF-8 labels (including emoji)
+/// - ASCII letters A-Z are automatically lowercased on-chain
+/// - For proper Unicode normalization, callers SHOULD pre-normalize using ENSIP-15
+/// - Off-chain: use adraffy/ens-normalize library or equivalent before calling
+/// - Example: normalize("RaFFY🚴‍♂️") => "raffy🚴‍♂" (do this off-chain, then call contract)
+contract NameNFT is ERC721, ReentrancyGuard {
+    /*//////////////////////////////////////////////////////////////
+                                 ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    error Expired();
+    error TooDeep();
+    error EmptyLabel();
+    error InvalidName();
+    error Unauthorized();
+    error InvalidLength();
+    error NotParentOwner();
+    error InsufficientFee();
+    error AlreadyCommitted();
+    error CommitmentTooNew();
+    error CommitmentTooOld();
+    error AlreadyRegistered();
+    error CommitmentNotFound();
+    error ZeroAddress();
+    error NotOwner();
+
+    /*//////////////////////////////////////////////////////////////
+                                 EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event NameRegistered(
+        uint256 indexed tokenId,
+        string label,
+        address indexed owner,
+        uint256 expiresAt
+    );
+    event SubdomainRegistered(
+        uint256 indexed tokenId,
+        uint256 indexed parentId,
+        string label
+    );
+    event NameRenewed(uint256 indexed tokenId, uint256 newExpiresAt);
+    event PrimaryNameSet(address indexed addr, uint256 indexed tokenId);
+    event Committed(bytes32 indexed commitment, address indexed committer);
+    event MetadataRendererUpdated(address indexed newRenderer);
+
+    // ENS-compatible resolver events (use bytes32 node for tooling compatibility)
+    event AddrChanged(bytes32 indexed node, address addr);
+    event ContenthashChanged(bytes32 indexed node, bytes contenthash);
+    event AddressChanged(bytes32 indexed node, uint256 coinType, bytes addr);
+    event TextChanged(bytes32 indexed node, string indexed key, string value);
+
+    /*//////////////////////////////////////////////////////////////
+                                CONSTANTS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Namehash of "etc" TLD - kept public for off-chain tooling
+    bytes32 public constant ETC_NODE =
+        0x2f142013fcc88d47bffe42e5d883f6081cbaa75abaa20e7f34f3043bbc8162c9;
+
+    uint256 constant MAX_LABEL_LENGTH = 255;
+    uint256 constant MIN_LABEL_LENGTH = 1;
+    uint256 constant MIN_COMMITMENT_AGE = 60;
+    uint256 constant MAX_COMMITMENT_AGE = 86400;
+    uint256 constant REGISTRATION_PERIOD = 365 days;
+    uint256 constant GRACE_PERIOD = 90 days;
+    uint256 constant MAX_SUBDOMAIN_DEPTH = 10;
+    uint256 constant COIN_TYPE_ETC = 61;
+    uint256 constant FEE_LEN1 = 25 ether; // 1-byte labels
+    uint256 constant FEE_LEN2 = 5 ether; // 2-byte labels
+    uint256 constant FEE_LEN3 = 1 ether; // 3-byte labels
+    uint256 constant FEE_LEN4 = 0.25 ether; // 4-byte labels
+    uint256 constant DEFAULT_FEE = 0.05 ether; // 5+ byte labels
+    uint256 constant MAX_PREMIUM = 100 ether;
+    uint256 constant PREMIUM_DECAY_PERIOD = 21 days;
+
+    /*//////////////////////////////////////////////////////////////
+                                 STORAGE
+    //////////////////////////////////////////////////////////////*/
+    address public feeRecipient;
+    address public owner;
+    INameMetadataRenderer public metadataRenderer;
+
+    constructor(address _feeRecipient, address _metadataRenderer) {
+        if (_feeRecipient == address(0) || _metadataRenderer == address(0))
+            revert ZeroAddress();
+        feeRecipient = _feeRecipient;
+        metadataRenderer = INameMetadataRenderer(_metadataRenderer);
+        owner = msg.sender;
+    }
+
+    function setFeeRecipient(address newRecipient) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (newRecipient == address(0)) revert ZeroAddress();
+        feeRecipient = newRecipient;
+    }
+
+    function setMetadataRenderer(address newRenderer) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (newRenderer == address(0)) revert ZeroAddress();
+        metadataRenderer = INameMetadataRenderer(newRenderer);
+        emit MetadataRendererUpdated(newRenderer);
+    }
+
+    function transferOwnership(address newOwner) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (newOwner == address(0)) revert ZeroAddress();
+        owner = newOwner;
+    }
+
+    struct NameRecord {
+        string label;
+        uint256 parent;
+        uint64 expiresAt;
+        uint64 epoch;
+        uint64 parentEpoch;
+    }
+
+    mapping(uint256 => NameRecord) public records;
+    mapping(uint256 => uint256) public recordVersion;
+    mapping(bytes32 => uint256) public commitments;
+    mapping(address => uint256) public primaryName;
+
+    // Versioned resolver data
+    mapping(uint256 => mapping(uint256 => address)) internal _resolvedAddress;
+    mapping(uint256 => mapping(uint256 => bytes)) internal _contenthash;
+    mapping(uint256 => mapping(uint256 => mapping(uint256 => bytes)))
+        internal _coinAddr;
+    mapping(uint256 => mapping(uint256 => mapping(string => string)))
+        internal _text;
+
+    /*//////////////////////////////////////////////////////////////
+                             ERC721 METADATA
+    //////////////////////////////////////////////////////////////*/
+
+    function name() public pure override(ERC721) returns (string memory) {
+        return "Etc Name Service";
+    }
+
+    function symbol() public pure override(ERC721) returns (string memory) {
+        return "ETC";
+    }
+
+    /// @dev Blocks transfers of inactive tokens, but allows mint (from==0) and burn (to==0)
+    /// This matches ENS behavior: expired names cannot be traded
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) internal virtual override(ERC721) {
+        // Allow mint and burn, block transfers of inactive tokens
+        if (from != address(0) && to != address(0)) {
+            if (!_isActive(tokenId)) revert Expired();
+        }
+    }
+
+    function tokenURI(
+        uint256 tokenId
+    ) public view override(ERC721) returns (string memory) {
+        if (!_recordExists(tokenId)) revert TokenDoesNotExist();
+
+        NameRecord storage record = records[tokenId];
+
+        // 0: Invalid (stale subdomain)
+        if (
+            record.parent != 0 &&
+            record.parentEpoch != records[record.parent].epoch
+        ) {
+            return metadataRenderer.renderTokenURI(0, "", true, 0);
+        }
+
+        // 1: Expired
+        if (!_isActive(tokenId)) {
+            return
+                metadataRenderer.renderTokenURI(
+                    1,
+                    "",
+                    record.parent != 0,
+                    record.expiresAt
+                );
+        }
+
+        // 2: Valid
+        string memory fullName = string.concat(_buildFullName(tokenId), ".etc");
+        return
+            metadataRenderer.renderTokenURI(
+                2,
+                fullName,
+                record.parent != 0,
+                record.expiresAt
+            );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            COMMIT-REVEAL
+    //////////////////////////////////////////////////////////////*/
+
+    function makeCommitment(
+        string calldata label,
+        address owner,
+        bytes32 secret
+    ) public pure returns (bytes32) {
+        bytes memory normalized = _validateAndNormalize(bytes(label));
+        return keccak256(abi.encode(normalized, owner, secret));
+    }
+
+    function commit(bytes32 commitment) public {
+        if (
+            commitments[commitment] != 0 &&
+            block.timestamp <= commitments[commitment] + MAX_COMMITMENT_AGE
+        ) {
+            revert AlreadyCommitted();
+        }
+        commitments[commitment] = block.timestamp;
+        emit Committed(commitment, msg.sender);
+    }
+
+    function reveal(
+        string calldata label,
+        bytes32 secret
+    ) external payable nonReentrant returns (uint256 tokenId) {
+        uint256 fee = getFee(bytes(label).length);
+        bytes memory normalized = _validateAndNormalize(bytes(label));
+
+        tokenId = uint256(
+            keccak256(abi.encodePacked(ETC_NODE, keccak256(normalized)))
+        );
+        uint256 premium = getPremium(tokenId);
+        uint256 total = fee + premium;
+
+        if (msg.value < total) revert InsufficientFee();
+
+        bytes32 commitment = keccak256(
+            abi.encode(normalized, msg.sender, secret)
+        );
+        uint256 committedAt = commitments[commitment];
+
+        if (committedAt == 0) revert CommitmentNotFound();
+        if (block.timestamp < committedAt + MIN_COMMITMENT_AGE)
+            revert CommitmentTooNew();
+        if (block.timestamp > committedAt + MAX_COMMITMENT_AGE)
+            revert CommitmentTooOld();
+
+        delete commitments[commitment];
+        _register(string(normalized), 0, msg.sender);
+
+        SafeTransferLib.safeTransferETH(feeRecipient, total);
+
+        if (msg.value > total) {
+            SafeTransferLib.safeTransferETH(msg.sender, msg.value - total);
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          SUBDOMAIN REGISTRATION
+    //////////////////////////////////////////////////////////////*/
+
+    function registerSubdomain(
+        string calldata label,
+        uint256 parentId
+    ) external nonReentrant returns (uint256) {
+        if (!_isActive(parentId)) revert Expired();
+        if (ownerOf(parentId) != msg.sender) revert NotParentOwner();
+        return _register(label, parentId, msg.sender);
+    }
+
+    function registerSubdomainFor(
+        string calldata label,
+        uint256 parentId,
+        address to
+    ) external nonReentrant returns (uint256) {
+        if (!_isActive(parentId)) revert Expired();
+        if (ownerOf(parentId) != msg.sender) revert NotParentOwner();
+        return _register(label, parentId, to);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               RENEWAL
+    //////////////////////////////////////////////////////////////*/
+
+    function renew(uint256 tokenId) public payable nonReentrant {
+        NameRecord storage record = records[tokenId];
+        if (bytes(record.label).length == 0) revert TokenDoesNotExist();
+        if (record.parent != 0) revert Unauthorized();
+        if (block.timestamp > record.expiresAt + GRACE_PERIOD) revert Expired();
+
+        uint256 fee = getFee(bytes(record.label).length);
+        if (msg.value < fee) revert InsufficientFee();
+
+        // Always extend from current expiry (ENS-style)
+        // This is consistent whether renewing early or during grace
+        record.expiresAt = record.expiresAt + uint64(REGISTRATION_PERIOD);
+
+        emit NameRenewed(tokenId, record.expiresAt);
+
+        SafeTransferLib.safeTransferETH(feeRecipient, fee);
+
+        if (msg.value > fee) {
+            SafeTransferLib.safeTransferETH(msg.sender, msg.value - fee);
+        }
+    }
+
+    function isExpired(uint256 tokenId) public view returns (bool) {
+        uint64 exp = records[tokenId].expiresAt;
+        return exp != 0 && block.timestamp > exp + GRACE_PERIOD;
+    }
+
+    function inGracePeriod(uint256 tokenId) public view returns (bool) {
+        uint64 exp = records[tokenId].expiresAt;
+        return
+            exp != 0 &&
+            block.timestamp > exp &&
+            block.timestamp <= exp + GRACE_PERIOD;
+    }
+
+    function expiresAt(uint256 tokenId) public view returns (uint256) {
+        return records[tokenId].expiresAt;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              RESOLUTION
+    //////////////////////////////////////////////////////////////*/
+
+    function setAddr(uint256 tokenId, address addr) public {
+        if (!_isActive(tokenId)) revert Expired();
+        if (ownerOf(tokenId) != msg.sender) revert Unauthorized();
+        _resolvedAddress[tokenId][recordVersion[tokenId]] = addr;
+        emit AddrChanged(bytes32(tokenId), addr);
+    }
+
+    function setPrimaryName(uint256 tokenId) public {
+        if (tokenId != 0) {
+            if (!_isActive(tokenId)) revert Expired();
+            address resolved = resolve(tokenId);
+            if (ownerOf(tokenId) != msg.sender && resolved != msg.sender)
+                revert Unauthorized();
+        }
+        primaryName[msg.sender] = tokenId;
+        emit PrimaryNameSet(msg.sender, tokenId);
+    }
+
+    function resolve(uint256 tokenId) public view returns (address) {
+        if (!_isActive(tokenId)) return address(0);
+        address addr = _resolvedAddress[tokenId][recordVersion[tokenId]];
+        return addr != address(0) ? addr : ownerOf(tokenId);
+    }
+
+    function reverseResolve(address addr) public view returns (string memory) {
+        uint256 tokenId = primaryName[addr];
+        if (tokenId == 0 || !_isActive(tokenId) || resolve(tokenId) != addr)
+            return "";
+        return string.concat(_buildFullName(tokenId), ".etc");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                         ENS-COMPATIBLE RESOLVER
+    //////////////////////////////////////////////////////////////*/
+
+    function setContenthash(uint256 tokenId, bytes calldata hash) public {
+        if (!_isActive(tokenId)) revert Expired();
+        if (ownerOf(tokenId) != msg.sender) revert Unauthorized();
+        _contenthash[tokenId][recordVersion[tokenId]] = hash;
+        emit ContenthashChanged(bytes32(tokenId), hash);
+    }
+
+    function contenthash(uint256 tokenId) public view returns (bytes memory) {
+        if (!_isActive(tokenId)) return "";
+        return _contenthash[tokenId][recordVersion[tokenId]];
+    }
+
+    function setAddrForCoin(
+        uint256 tokenId,
+        uint256 coinType,
+        bytes calldata addr
+    ) public {
+        if (!_isActive(tokenId)) revert Expired();
+        if (ownerOf(tokenId) != msg.sender) revert Unauthorized();
+        _coinAddr[tokenId][recordVersion[tokenId]][coinType] = addr;
+        emit AddressChanged(bytes32(tokenId), coinType, addr);
+    }
+
+    function addr(
+        uint256 tokenId,
+        uint256 coinType
+    ) public view returns (bytes memory) {
+        if (!_isActive(tokenId)) return "";
+        uint256 v = recordVersion[tokenId];
+        if (coinType == COIN_TYPE_ETC) {
+            bytes memory a = _coinAddr[tokenId][v][COIN_TYPE_ETC];
+            if (a.length > 0) return a;
+            address resolved = resolve(tokenId);
+            if (resolved != address(0)) return abi.encodePacked(resolved);
+        }
+        return _coinAddr[tokenId][v][coinType];
+    }
+
+    function setText(
+        uint256 tokenId,
+        string calldata key,
+        string calldata value
+    ) public {
+        if (!_isActive(tokenId)) revert Expired();
+        if (ownerOf(tokenId) != msg.sender) revert Unauthorized();
+        _text[tokenId][recordVersion[tokenId]][key] = value;
+        emit TextChanged(bytes32(tokenId), key, value);
+    }
+
+    function text(
+        uint256 tokenId,
+        string calldata key
+    ) public view returns (string memory) {
+        if (!_isActive(tokenId)) return "";
+        return _text[tokenId][recordVersion[tokenId]][key];
+    }
+
+    // bytes32 overloads for ENS compatibility
+    function addr(bytes32 node) public view returns (address) {
+        return resolve(uint256(node));
+    }
+
+    function addr(
+        bytes32 node,
+        uint256 coinType
+    ) public view returns (bytes memory) {
+        uint256 tokenId = uint256(node);
+        if (!_isActive(tokenId)) return "";
+        uint256 v = recordVersion[tokenId];
+        if (coinType == COIN_TYPE_ETC) {
+            bytes memory a = _coinAddr[tokenId][v][COIN_TYPE_ETC];
+            if (a.length > 0) return a;
+            address resolved = resolve(tokenId);
+            if (resolved != address(0)) return abi.encodePacked(resolved);
+        }
+        return _coinAddr[tokenId][v][coinType];
+    }
+
+    function text(
+        bytes32 node,
+        string calldata key
+    ) public view returns (string memory) {
+        uint256 tokenId = uint256(node);
+        if (!_isActive(tokenId)) return "";
+        return _text[tokenId][recordVersion[tokenId]][key];
+    }
+
+    function contenthash(bytes32 node) public view returns (bytes memory) {
+        uint256 tokenId = uint256(node);
+        if (!_isActive(tokenId)) return "";
+        return _contenthash[tokenId][recordVersion[tokenId]];
+    }
+
+    function supportsInterface(
+        bytes4 interfaceId
+    ) public view virtual override returns (bool) {
+        return
+            interfaceId == 0x3b3b57de ||
+            interfaceId == 0xf1cb7e06 ||
+            interfaceId == 0x59d1d43c ||
+            interfaceId == 0xbc1c58d1 ||
+            super.supportsInterface(interfaceId);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               LOOKUPS
+    //////////////////////////////////////////////////////////////*/
+
+    function computeId(string calldata fullName) public pure returns (uint256) {
+        return uint256(computeNamehash(fullName));
+    }
+
+    /// @notice Compute namehash for a full name (e.g. "sub.name.etc" or "name")
+    /// @dev This function is intentionally permissive - it lowercases and hashes any input.
+    ///      Registration enforces validation: valid UTF-8, no space/control chars/dot.
+    ///      Use normalize() to check if a label is valid for registration.
+    function computeNamehash(
+        string calldata fullName
+    ) public pure returns (bytes32 node) {
+        bytes memory b = bytes(fullName);
+        if (b.length == 0) return ETC_NODE;
+
+        uint256 len = b.length;
+
+        // Strip .etc suffix if present
+        if (
+            len >= 4 &&
+            b[len - 4] == 0x2e &&
+            (b[len - 3] == 0x65 || b[len - 3] == 0x45) &&
+            (b[len - 2] == 0x74 || b[len - 2] == 0x54) &&
+            (b[len - 1] == 0x63 || b[len - 1] == 0x43)
+        ) {
+            len -= 4;
+        }
+
+        if (len == 0) return ETC_NODE;
+        if (b[0] == 0x2e || b[len - 1] == 0x2e) revert EmptyLabel();
+
+        node = ETC_NODE;
+        uint256 labelEnd = len;
+
+        for (uint256 i = len; i > 0; --i) {
+            if (b[i - 1] == 0x2e) {
+                if (i >= labelEnd) revert EmptyLabel();
+                node = keccak256(
+                    abi.encodePacked(
+                        node,
+                        keccak256(_toLowerSlice(b, i, labelEnd))
+                    )
+                );
+                labelEnd = i - 1;
+            }
+        }
+
+        if (labelEnd > 0) {
+            node = keccak256(
+                abi.encodePacked(node, keccak256(_toLowerSlice(b, 0, labelEnd)))
+            );
+        }
+    }
+
+    /// @notice Check if a label is available for registration
+    /// @dev For subdomains, returns false if subdomain exists and is active, even though
+    ///      the parent owner can overwrite it. Parent owners should use registerSubdomain()
+    ///      directly - it will succeed for reclaim even when isAvailable() returns false.
+    function isAvailable(
+        string calldata label,
+        uint256 parentId
+    ) public view returns (bool) {
+        bytes memory b = bytes(label);
+        if (b.length < MIN_LABEL_LENGTH || b.length > MAX_LABEL_LENGTH)
+            return false;
+
+        // UTF-8 validation and normalization (mirrors _validateAndNormalize but returns false instead of reverting)
+        bytes memory normalized = new bytes(b.length);
+        uint256 i;
+
+        while (i < b.length) {
+            uint8 cb = uint8(b[i]);
+
+            // Reject control chars, space, dot, DEL
+            if (cb <= 0x20 || cb == 0x7f || cb == 0x2e) return false;
+
+            if (cb < 0x80) {
+                // ASCII: lowercase A-Z
+                normalized[i] = (cb >= 0x41 && cb <= 0x5a)
+                    ? bytes1(cb + 32)
+                    : b[i];
+                i++;
+            } else if (cb < 0xC2) {
+                return false; // Invalid UTF-8 start byte
+            } else if (cb < 0xE0) {
+                if (i + 1 >= b.length) return false;
+                uint8 b1 = uint8(b[i + 1]);
+                if (b1 < 0x80 || b1 > 0xBF) return false;
+                normalized[i] = b[i];
+                normalized[i + 1] = b[i + 1];
+                i += 2;
+            } else if (cb < 0xF0) {
+                if (i + 2 >= b.length) return false;
+                uint8 b1 = uint8(b[i + 1]);
+                uint8 b2 = uint8(b[i + 2]);
+                if (b1 < 0x80 || b1 > 0xBF || b2 < 0x80 || b2 > 0xBF)
+                    return false;
+                if (cb == 0xE0 && b1 < 0xA0) return false; // Overlong
+                if (cb == 0xED && b1 >= 0xA0) return false; // Surrogate
+                normalized[i] = b[i];
+                normalized[i + 1] = b[i + 1];
+                normalized[i + 2] = b[i + 2];
+                i += 3;
+            } else if (cb < 0xF5) {
+                if (i + 3 >= b.length) return false;
+                uint8 b1 = uint8(b[i + 1]);
+                uint8 b2 = uint8(b[i + 2]);
+                uint8 b3 = uint8(b[i + 3]);
+                if (
+                    b1 < 0x80 ||
+                    b1 > 0xBF ||
+                    b2 < 0x80 ||
+                    b2 > 0xBF ||
+                    b3 < 0x80 ||
+                    b3 > 0xBF
+                ) {
+                    return false;
+                }
+                if (cb == 0xF0 && b1 < 0x90) return false; // Overlong
+                if (cb == 0xF4 && b1 > 0x8F) return false; // Above U+10FFFF
+                normalized[i] = b[i];
+                normalized[i + 1] = b[i + 1];
+                normalized[i + 2] = b[i + 2];
+                normalized[i + 3] = b[i + 3];
+                i += 4;
+            } else {
+                return false; // Invalid UTF-8
+            }
+        }
+
+        // Hyphen rules
+        if (normalized[0] == 0x2d || normalized[b.length - 1] == 0x2d)
+            return false;
+
+        bytes32 parentNode = parentId == 0 ? ETC_NODE : bytes32(parentId);
+        uint256 tokenId = uint256(
+            keccak256(abi.encodePacked(parentNode, keccak256(normalized)))
+        );
+
+        if (parentId != 0 && !_isActive(parentId)) return false;
+        if (parentId != 0 && _getDepth(parentId) >= MAX_SUBDOMAIN_DEPTH)
+            return false;
+        if (!_recordExists(tokenId)) return true;
+
+        NameRecord storage record = records[tokenId];
+        if (record.parent == 0) return isExpired(tokenId);
+
+        if (parentId != 0) {
+            return record.parentEpoch != records[parentId].epoch;
+        }
+        return false;
+    }
+
+    function getFullName(uint256 tokenId) public view returns (string memory) {
+        string memory baseName = _buildFullName(tokenId);
+        if (bytes(baseName).length == 0) return "";
+        return string.concat(baseName, ".etc");
+    }
+
+    /// @notice On-chain normalization (lowercases ASCII only)
+    /// @dev For full Unicode normalization, use ENSIP-15 library off-chain
+    function normalize(
+        string calldata label
+    ) public pure returns (string memory) {
+        return string(_validateAndNormalize(bytes(label)));
+    }
+
+    /// @notice Check if label contains only ASCII characters
+    /// @dev If true, on-chain normalize() is sufficient. If false, use ENSIP-15 off-chain.
+    function isAsciiLabel(string calldata label) public pure returns (bool) {
+        bytes memory b = bytes(label);
+        for (uint256 i; i < b.length; ++i) {
+            if (uint8(b[i]) > 127) return false;
+        }
+        return true;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            FEE MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    function getFee(uint256 length) public pure returns (uint256) {
+        if (length == 1) return FEE_LEN1;
+        if (length == 2) return FEE_LEN2;
+        if (length == 3) return FEE_LEN3;
+        if (length == 4) return FEE_LEN4;
+        return DEFAULT_FEE;
+    }
+
+    function getPremium(uint256 tokenId) public view returns (uint256) {
+        NameRecord storage record = records[tokenId];
+        if (bytes(record.label).length == 0 || record.parent != 0) return 0;
+
+        uint256 gracePeriodEnd = record.expiresAt + GRACE_PERIOD;
+        if (block.timestamp <= gracePeriodEnd) return 0;
+
+        uint256 elapsed = block.timestamp - gracePeriodEnd;
+        if (elapsed >= PREMIUM_DECAY_PERIOD) return 0;
+
+        return
+            (MAX_PREMIUM * (PREMIUM_DECAY_PERIOD - elapsed)) /
+            PREMIUM_DECAY_PERIOD;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          INTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function _register(
+        string memory label,
+        uint256 parentId,
+        address to
+    ) internal returns (uint256 tokenId) {
+        bytes memory normalized = _validateAndNormalize(bytes(label));
+        bytes32 parentNode = parentId == 0 ? ETC_NODE : bytes32(parentId);
+        tokenId = uint256(
+            keccak256(abi.encodePacked(parentNode, keccak256(normalized)))
+        );
+
+        // Invariant: subdomain registration requires parent ownership
+        if (parentId != 0) {
+            if (ownerOf(parentId) != msg.sender) revert NotParentOwner();
+            if (_getDepth(parentId) >= MAX_SUBDOMAIN_DEPTH) revert TooDeep();
+        }
+
+        NameRecord storage existing = records[tokenId];
+        uint64 newEpoch = 1;
+
+        if (bytes(existing.label).length > 0) {
+            if (parentId == 0) {
+                // Top-level: must be expired past grace
+                if (block.timestamp <= existing.expiresAt + GRACE_PERIOD) {
+                    revert AlreadyRegistered();
+                }
+            }
+            // Subdomain overwrites: parent owner can always reclaim (checked above)
+            // Stale subdomains can also be overwritten by new parent owner
+
+            newEpoch = existing.epoch + 1;
+            address oldOwner = ownerOf(tokenId); // Safe: _burn allows burning inactive tokens
+            _burn(tokenId);
+            if (primaryName[oldOwner] == tokenId) delete primaryName[oldOwner];
+            recordVersion[tokenId]++;
+        }
+
+        records[tokenId] = NameRecord({
+            label: string(normalized),
+            parent: parentId,
+            expiresAt: parentId == 0
+                ? uint64(block.timestamp + REGISTRATION_PERIOD)
+                : 0,
+            epoch: newEpoch,
+            parentEpoch: parentId == 0 ? 0 : records[parentId].epoch
+        });
+
+        _safeMint(to, tokenId);
+
+        emit NameRegistered(
+            tokenId,
+            string(normalized),
+            to,
+            records[tokenId].expiresAt
+        );
+        if (parentId != 0)
+            emit SubdomainRegistered(tokenId, parentId, string(normalized));
+    }
+
+    /// @notice Validates UTF-8 encoding and lowercases ASCII. Unicode normalization should be done off-chain.
+    /// @dev Validates UTF-8 structure (rejects invalid sequences, overlong encodings, surrogates).
+    ///      Only ASCII A-Z is lowercased. For full Unicode normalization, use ENSIP-15 off-chain.
+    function _validateAndNormalize(
+        bytes memory b
+    ) internal pure returns (bytes memory) {
+        if (b.length < MIN_LABEL_LENGTH || b.length > MAX_LABEL_LENGTH)
+            revert InvalidLength();
+
+        bytes memory result = new bytes(b.length);
+        uint256 i;
+
+        while (i < b.length) {
+            uint8 cb = uint8(b[i]);
+
+            // Reject control characters (0x00-0x1F), space (0x20), dot (0x2E), and DEL (0x7F)
+            if (cb <= 0x20 || cb == 0x7f || cb == 0x2e) revert InvalidName();
+
+            if (cb < 0x80) {
+                // ASCII: lowercase A-Z
+                if (cb >= 0x41 && cb <= 0x5a) {
+                    result[i] = bytes1(cb + 32);
+                } else {
+                    result[i] = b[i];
+                }
+                i++;
+            } else if (cb < 0xC2) {
+                // 0x80-0xC1: invalid (continuation bytes or overlong)
+                revert InvalidName();
+            } else if (cb < 0xE0) {
+                // 2-byte sequence: 0xC2-0xDF followed by 1 continuation byte
+                if (i + 1 >= b.length) revert InvalidName();
+                if (uint8(b[i + 1]) < 0x80 || uint8(b[i + 1]) > 0xBF)
+                    revert InvalidName();
+                result[i] = b[i];
+                result[i + 1] = b[i + 1];
+                i += 2;
+            } else if (cb < 0xF0) {
+                // 3-byte sequence: 0xE0-0xEF followed by 2 continuation bytes
+                if (i + 2 >= b.length) revert InvalidName();
+                uint8 b1 = uint8(b[i + 1]);
+                uint8 b2 = uint8(b[i + 2]);
+                // Check continuation bytes are valid
+                if (b1 < 0x80 || b1 > 0xBF || b2 < 0x80 || b2 > 0xBF)
+                    revert InvalidName();
+                // Reject overlong (0xE0 must be followed by 0xA0-0xBF)
+                if (cb == 0xE0 && b1 < 0xA0) revert InvalidName();
+                // Reject surrogates (0xED followed by 0xA0-0xBF = U+D800-U+DFFF)
+                if (cb == 0xED && b1 >= 0xA0) revert InvalidName();
+                result[i] = b[i];
+                result[i + 1] = b[i + 1];
+                result[i + 2] = b[i + 2];
+                i += 3;
+            } else if (cb < 0xF5) {
+                // 4-byte sequence: 0xF0-0xF4 followed by 3 continuation bytes
+                if (i + 3 >= b.length) revert InvalidName();
+                uint8 b1 = uint8(b[i + 1]);
+                uint8 b2 = uint8(b[i + 2]);
+                uint8 b3 = uint8(b[i + 3]);
+                // Check continuation bytes are valid
+                if (
+                    b1 < 0x80 ||
+                    b1 > 0xBF ||
+                    b2 < 0x80 ||
+                    b2 > 0xBF ||
+                    b3 < 0x80 ||
+                    b3 > 0xBF
+                ) {
+                    revert InvalidName();
+                }
+                // Reject overlong (0xF0 must be followed by 0x90-0xBF)
+                if (cb == 0xF0 && b1 < 0x90) revert InvalidName();
+                // Reject above U+10FFFF (0xF4 must be followed by 0x80-0x8F)
+                if (cb == 0xF4 && b1 > 0x8F) revert InvalidName();
+                result[i] = b[i];
+                result[i + 1] = b[i + 1];
+                result[i + 2] = b[i + 2];
+                result[i + 3] = b[i + 3];
+                i += 4;
+            } else {
+                // 0xF5-0xFF: invalid
+                revert InvalidName();
+            }
+        }
+
+        // Hyphen rules: can't start or end with hyphen
+        if (result[0] == 0x2d || result[b.length - 1] == 0x2d)
+            revert InvalidName();
+
+        return result;
+    }
+
+    function _toLowerSlice(
+        bytes memory b,
+        uint256 start,
+        uint256 end
+    ) internal pure returns (bytes memory) {
+        unchecked {
+            uint256 len = end - start;
+            bytes memory result = new bytes(len);
+            for (uint256 i; i < len; ++i) {
+                bytes1 c = b[start + i];
+                result[i] = (c >= 0x41 && c <= 0x5a)
+                    ? bytes1(uint8(c) + 32)
+                    : c;
+            }
+            return result;
+        }
+    }
+
+    function _recordExists(uint256 tokenId) internal view returns (bool) {
+        return bytes(records[tokenId].label).length > 0;
+    }
+
+    function _getDepth(uint256 tokenId) internal view returns (uint256 depth) {
+        uint256 current = tokenId;
+        while (current != 0) {
+            uint256 parent = records[current].parent;
+            if (parent == 0) break;
+            depth++;
+            if (depth > MAX_SUBDOMAIN_DEPTH) return depth;
+            current = parent;
+        }
+    }
+
+    function _isActive(uint256 tokenId) internal view returns (bool) {
+        return _isActiveWithDepth(tokenId, 0);
+    }
+
+    function _isActiveWithDepth(
+        uint256 tokenId,
+        uint256 depth
+    ) internal view returns (bool) {
+        if (depth > MAX_SUBDOMAIN_DEPTH) return false;
+        NameRecord storage record = records[tokenId];
+        if (bytes(record.label).length == 0) return false;
+
+        if (record.parent != 0) {
+            if (record.parentEpoch != records[record.parent].epoch)
+                return false;
+            return _isActiveWithDepth(record.parent, depth + 1);
+        }
+        // ENS-like: active only until expiresAt (not through grace)
+        // Grace period is for renewal only, not transfers/resolver writes
+        return block.timestamp <= record.expiresAt;
+    }
+
+    function _buildFullName(
+        uint256 tokenId
+    ) internal view returns (string memory) {
+        return _buildFullNameWithDepth(tokenId, 0);
+    }
+
+    function _buildFullNameWithDepth(
+        uint256 tokenId,
+        uint256 depth
+    ) internal view returns (string memory) {
+        if (tokenId == 0 || depth > MAX_SUBDOMAIN_DEPTH) return "";
+        NameRecord storage record = records[tokenId];
+        if (bytes(record.label).length == 0) return "";
+
+        if (
+            record.parent != 0 &&
+            record.parentEpoch != records[record.parent].epoch
+        ) return "";
+        if (record.parent == 0) return record.label;
+
+        string memory parentName = _buildFullNameWithDepth(
+            record.parent,
+            depth + 1
+        );
+        if (bytes(parentName).length == 0) return "";
+        return string.concat(record.label, ".", parentName);
+    }
+}
