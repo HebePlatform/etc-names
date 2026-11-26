@@ -95,13 +95,13 @@ Immediately after a name fully expires (grace period ends), a premium is charged
 premium = MAX_PREMIUM * (PREMIUM_DECAY_PERIOD - elapsed) / PREMIUM_DECAY_PERIOD
 ```
 
-Where `elapsed` is seconds since `expiresAt + GRACE_PERIOD`. After the decay period, premium is 0. Like the base fee, this premium is **burned** (locked in the contract) — it is an anti-snipe cost, not revenue.
+Where `elapsed` is seconds since `expiresAt + GRACE_PERIOD`. After the decay period, premium is 0. Like the base fee.
 
 ---
 
 ## Fee Structure
 
-### Fixed Length-Based Schedule, and Burned
+### Fixed Length-Based Schedule
 
 HENS keeps the — shorter labels cost more, to make squatting premium names expensive — but freezes it into `constant`s:
 
