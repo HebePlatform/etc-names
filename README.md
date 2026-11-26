@@ -2,6 +2,12 @@
 ETC Name Service (.Etc Name) brings decentralized name registration, reverse primary names, free subname distribution, and multi-coin / text / contenthash record management to Ethereum Classic Mainnet. No more hex addresses — payments, dApps and social identity become readable at a glance.  
 https://etcname.com 
 
+| Contract | Mainnet | 
+|---|---|
+| `NameNFT.sol` | [`0xFfC26c447c90f9eBdAe34A0C368f702c4643de34`](https://etc.blockscout.com/address/0xFfC26c447c90f9eBdAe34A0C368f702c4643de34) |
+| `MetadataRenderer.sol` | [`0x64E11DD4aC0C7ea856AbDC1524dB8094cEfb4c97`](https://etc.blockscout.com/address/0x64E11DD4aC0C7ea856AbDC1524dB8094cEfb4c97) |
+
+
 ## Overview
 
 HENS provides `.etc` names as NFTs (ERC-721). Names can:
